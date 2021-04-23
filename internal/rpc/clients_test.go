@@ -15,59 +15,70 @@
 package rpc
 
 import (
-	"context"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"testing"
 
-	"github.com/spf13/viper"
-	"open-match.dev/open-match/internal/config"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
-	"open-match.dev/open-match/internal/monitoring"
+	"open-match.dev/open-match/internal/config"
+	"open-match.dev/open-match/internal/telemetry"
 	shellTesting "open-match.dev/open-match/internal/testing"
-	netlistenerTesting "open-match.dev/open-match/internal/util/netlistener/testing"
+	utilTesting "open-match.dev/open-match/internal/util/testing"
 	"open-match.dev/open-match/pkg/pb"
 	certgenTesting "open-match.dev/open-match/tools/certgen/testing"
 )
 
 func TestSecureGRPCFromConfig(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
-	cfg, rpcParams, closer := configureConfigAndKeysForTesting(assert, true)
+	cfg, rpcParams, closer := configureConfigAndKeysForTesting(t, require, true, "localhost")
 	defer closer()
 
-	runGrpcClientTests(assert, cfg, rpcParams)
+	runSuccessGrpcClientTests(t, require, cfg, rpcParams)
 }
 
 func TestInsecureGRPCFromConfig(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
-	cfg, rpcParams, closer := configureConfigAndKeysForTesting(assert, false)
+	cfg, rpcParams, closer := configureConfigAndKeysForTesting(t, require, false, "localhost")
 	defer closer()
 
-	runGrpcClientTests(assert, cfg, rpcParams)
+	runSuccessGrpcClientTests(t, require, cfg, rpcParams)
+}
+
+func TestUnavailableGRPCFromConfig(t *testing.T) {
+	require := require.New(t)
+
+	cfg, rpcParams, closer := configureConfigAndKeysForTesting(t, require, false, "badhost")
+	defer closer()
+
+	runFailureGrpcClientTests(t, require, cfg, rpcParams, codes.Unavailable)
 }
 
 func TestHTTPSFromConfig(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
-	cfg, rpcParams, closer := configureConfigAndKeysForTesting(assert, true)
+	cfg, rpcParams, closer := configureConfigAndKeysForTesting(t, require, true, "localhost")
 	defer closer()
 
-	runHTTPClientTests(assert, cfg, rpcParams)
+	runHTTPClientTests(require, cfg, rpcParams)
 }
 
 func TestInsecureHTTPFromConfig(t *testing.T) {
-	assert := assert.New(t)
+	require := require.New(t)
 
-	cfg, rpcParams, closer := configureConfigAndKeysForTesting(assert, false)
+	cfg, rpcParams, closer := configureConfigAndKeysForTesting(t, require, false, "localhost")
 	defer closer()
 
-	runHTTPClientTests(assert, cfg, rpcParams)
+	runHTTPClientTests(require, cfg, rpcParams)
 }
 
 func TestSanitizeHTTPAddress(t *testing.T) {
@@ -89,64 +100,83 @@ func TestSanitizeHTTPAddress(t *testing.T) {
 		tc := testCase
 		description := fmt.Sprintf("sanitizeHTTPAddress(%s, %t) => (%s, %v)", tc.address, tc.preferHTTPS, tc.expected, tc.err)
 		t.Run(description, func(t *testing.T) {
-			assert := assert.New(t)
+			require := require.New(t)
 			actual, err := sanitizeHTTPAddress(tc.address, tc.preferHTTPS)
-			assert.Equal(tc.expected, actual)
-			assert.Equal(tc.err, err)
+			require.Equal(tc.expected, actual)
+			require.Equal(tc.err, err)
 		})
 	}
 }
 
-func runGrpcClientTests(assert *assert.Assertions, cfg config.View, rpcParams *ServerParams) {
+func setupClientConnection(t *testing.T, require *require.Assertions, cfg config.View, rpcParams *ServerParams) *grpc.ClientConn {
 	// Serve a fake frontend server and wait for its full start up
 	ff := &shellTesting.FakeFrontend{}
 	rpcParams.AddHandleFunc(func(s *grpc.Server) {
-		pb.RegisterFrontendServer(s, ff)
-	}, pb.RegisterFrontendHandlerFromEndpoint)
+		pb.RegisterFrontendServiceServer(s, ff)
+	}, pb.RegisterFrontendServiceHandlerFromEndpoint)
 
 	s := &Server{}
-	defer s.Stop()
-	waitForStart, err := s.Start(rpcParams)
-	assert.Nil(err)
-	waitForStart()
+	t.Cleanup(func() {
+		defer s.Stop()
+	})
+	err := s.Start(rpcParams)
+	require.Nil(err)
 
 	// Acquire grpc client
 	grpcConn, err := GRPCClientFromConfig(cfg, "test")
-	assert.Nil(err)
-	assert.NotNil(grpcConn)
-
-	// Confirm the client works as expected
-	ctx := context.Background()
-	feClient := pb.NewFrontendClient(grpcConn)
-	grpcResp, err := feClient.CreateTicket(ctx, &pb.CreateTicketRequest{})
-	assert.Nil(err)
-	assert.NotNil(grpcResp)
+	require.Nil(err)
+	require.NotNil(grpcConn)
+	return grpcConn
 }
 
-func runHTTPClientTests(assert *assert.Assertions, cfg config.View, rpcParams *ServerParams) {
+func runSuccessGrpcClientTests(t *testing.T, require *require.Assertions, cfg config.View, rpcParams *ServerParams) {
+	grpcConn := setupClientConnection(t, require, cfg, rpcParams)
+
+	// Confirm the client works as expected
+	ctx := utilTesting.NewContext(t)
+	feClient := pb.NewFrontendServiceClient(grpcConn)
+	grpcResp, err := feClient.CreateTicket(ctx, &pb.CreateTicketRequest{})
+	require.Nil(err)
+	require.NotNil(grpcResp)
+}
+
+func runFailureGrpcClientTests(t *testing.T, require *require.Assertions, cfg config.View, rpcParams *ServerParams, expectedCode codes.Code) {
+	grpcConn := setupClientConnection(t, require, cfg, rpcParams)
+
+	// Confirm the client works as expected
+	ctx := utilTesting.NewContext(t)
+	feClient := pb.NewFrontendServiceClient(grpcConn)
+	grpcResp, err := feClient.CreateTicket(ctx, &pb.CreateTicketRequest{})
+	require.Error(err)
+	require.Nil(grpcResp)
+
+	code := status.Code(err)
+	require.Equal(expectedCode, code)
+}
+
+func runHTTPClientTests(require *require.Assertions, cfg config.View, rpcParams *ServerParams) {
 	// Serve a fake frontend server and wait for its full start up
 	ff := &shellTesting.FakeFrontend{}
 	rpcParams.AddHandleFunc(func(s *grpc.Server) {
-		pb.RegisterFrontendServer(s, ff)
-	}, pb.RegisterFrontendHandlerFromEndpoint)
+		pb.RegisterFrontendServiceServer(s, ff)
+	}, pb.RegisterFrontendServiceHandlerFromEndpoint)
 	s := &Server{}
 	defer s.Stop()
-	waitForStart, err := s.Start(rpcParams)
-	assert.Nil(err)
-	waitForStart()
+	err := s.Start(rpcParams)
+	require.Nil(err)
 
 	// Acquire http client
 	httpClient, baseURL, err := HTTPClientFromConfig(cfg, "test")
-	assert.Nil(err)
+	require.Nil(err)
 
 	// Confirm the client works as expected
-	httpReq, err := http.NewRequest(http.MethodGet, baseURL+monitoring.HealthCheckEndpoint, nil)
-	assert.Nil(err)
-	assert.NotNil(httpReq)
+	httpReq, err := http.NewRequest(http.MethodGet, baseURL+telemetry.HealthCheckEndpoint, nil)
+	require.Nil(err)
+	require.NotNil(httpReq)
 
 	httpResp, err := httpClient.Do(httpReq)
-	assert.Nil(err)
-	assert.NotNil(httpResp)
+	require.Nil(err)
+	require.NotNil(httpResp)
 	defer func() {
 		if httpResp != nil {
 			httpResp.Body.Close()
@@ -154,39 +184,39 @@ func runHTTPClientTests(assert *assert.Assertions, cfg config.View, rpcParams *S
 	}()
 
 	body, err := ioutil.ReadAll(httpResp.Body)
-	assert.Nil(err)
-	assert.Equal(200, httpResp.StatusCode)
-	assert.Equal("ok", string(body))
+	require.Nil(err)
+	require.Equal(200, httpResp.StatusCode)
+	require.Equal("ok", string(body))
 }
 
 // Generate a config view and optional TLS key manifests (optional) for testing
-func configureConfigAndKeysForTesting(assert *assert.Assertions, tlsEnabled bool) (config.View, *ServerParams, func()) {
+func configureConfigAndKeysForTesting(t *testing.T, require *require.Assertions, tlsEnabled bool, host string) (config.View, *ServerParams, func()) {
 	// Create netlisteners on random ports used for rpc serving
-	grpcLh := netlistenerTesting.MustListen()
-	httpLh := netlistenerTesting.MustListen()
-	rpcParams := NewServerParamsFromListeners(grpcLh, httpLh)
+	grpcL := MustListen()
+	httpL := MustListen()
+	rpcParams := NewServerParamsFromListeners(grpcL, httpL)
 
 	// Generate a config view with paths to the manifests
 	cfg := viper.New()
-	cfg.Set("test.hostname", "localhost")
-	cfg.Set("test.grpcport", grpcLh.Number())
-	cfg.Set("test.httpport", httpLh.Number())
+	cfg.Set("test.hostname", host)
+	cfg.Set("test.grpcport", MustGetPortNumber(grpcL))
+	cfg.Set("test.httpport", MustGetPortNumber(httpL))
 
 	// Create temporary TLS key files for testing
 	pubFile, err := ioutil.TempFile("", "pub*")
-	assert.Nil(err)
+	require.Nil(err)
 
 	if tlsEnabled {
 		// Generate public and private key bytes
 		pubBytes, priBytes, err := certgenTesting.CreateCertificateAndPrivateKeyForTesting([]string{
-			fmt.Sprintf("localhost:%d", grpcLh.Number()),
-			fmt.Sprintf("localhost:%d", httpLh.Number()),
+			fmt.Sprintf("localhost:%s", MustGetPortNumber(grpcL)),
+			fmt.Sprintf("localhost:%s", MustGetPortNumber(httpL)),
 		})
-		assert.Nil(err)
+		require.Nil(err)
 
 		// Write certgen key bytes to the temp files
 		err = ioutil.WriteFile(pubFile.Name(), pubBytes, 0400)
-		assert.Nil(err)
+		require.Nil(err)
 
 		// Generate a config view with paths to the manifests
 		cfg.Set(configNameClientTrustedCertificatePath, pubFile.Name())
@@ -194,12 +224,30 @@ func configureConfigAndKeysForTesting(assert *assert.Assertions, tlsEnabled bool
 		rpcParams.SetTLSConfiguration(pubBytes, pubBytes, priBytes)
 	}
 
-	return cfg, rpcParams, func() { removeTempFile(assert, pubFile.Name()) }
+	return cfg, rpcParams, func() { removeTempFile(t, pubFile.Name()) }
 }
 
-func removeTempFile(assert *assert.Assertions, paths ...string) {
+func MustListen() net.Listener {
+	l, err := net.Listen("tcp", ":0")
+	if err != nil {
+		panic(err)
+	}
+	return l
+}
+
+func MustGetPortNumber(l net.Listener) string {
+	_, port, err := net.SplitHostPort(l.Addr().String())
+	if err != nil {
+		panic(err)
+	}
+	return port
+}
+
+func removeTempFile(t *testing.T, paths ...string) {
 	for _, path := range paths {
 		err := os.Remove(path)
-		assert.Nil(err)
+		if err != nil {
+			t.Errorf("Can not remove the temporary file: %s, err: %s", path, err.Error())
+		}
 	}
 }

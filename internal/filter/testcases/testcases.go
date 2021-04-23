@@ -16,98 +16,442 @@
 package testcases
 
 import (
+	"fmt"
 	"math"
+	"time"
 
-	structpb "github.com/golang/protobuf/ptypes/struct"
+	"github.com/golang/protobuf/ptypes"
+	tspb "github.com/golang/protobuf/ptypes/timestamp"
 	"open-match.dev/open-match/pkg/pb"
-	"open-match.dev/open-match/pkg/structs"
 )
 
 // TestCase defines a single filtering test case to run.
 type TestCase struct {
-	Name   string
-	Ticket *pb.Ticket
-	Filter *pb.Filter
+	Name         string
+	SearchFields *pb.SearchFields
+	Pool         *pb.Pool
 }
 
 // IncludedTestCases returns a list of test cases where using the given filter,
 // the ticket is included in the result.
 func IncludedTestCases() []TestCase {
+	now := time.Now()
 	return []TestCase{
-		simpleRangeTest("simpleInRange", 5, 0, 10),
-		simpleRangeTest("exactMatch", 5, 5, 5),
-		simpleRangeTest("infinityMax", math.Inf(1), 0, math.Inf(1)),
-		simpleRangeTest("infinityMin", math.Inf(-1), math.Inf(-1), 0),
+		{
+			"no filters or fields",
+			nil,
+			&pb.Pool{},
+		},
+
+		simpleDoubleRange("simpleInRange", 5, 0, 10, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("simpleInRange", 5, 0, 10, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("simpleInRange", 5, 0, 10, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("simpleInRange", 5, 0, 10, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("exactMatch", 5, 5, 5, pb.DoubleRangeFilter_NONE),
+
+		simpleDoubleRange("infinityMax", math.Inf(1), 0, math.Inf(1), pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("infinityMax", math.Inf(1), 0, math.Inf(1), pb.DoubleRangeFilter_MIN),
+
+		simpleDoubleRange("infinityMin", math.Inf(-1), math.Inf(-1), 0, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("infinityMin", math.Inf(-1), math.Inf(-1), 0, pb.DoubleRangeFilter_MAX),
+
+		simpleDoubleRange("excludeNone", 0, 0, 1, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("excludeNone", 1, 0, 1, pb.DoubleRangeFilter_NONE),
+
+		simpleDoubleRange("excludeMin", 1, 0, 1, pb.DoubleRangeFilter_MIN),
+
+		simpleDoubleRange("excludeMax", 0, 0, 1, pb.DoubleRangeFilter_MAX),
+
+		simpleDoubleRange("excludeBoth", 2, 0, 3, pb.DoubleRangeFilter_BOTH),
+		simpleDoubleRange("excludeBoth", 1, 0, 3, pb.DoubleRangeFilter_BOTH),
+
+		{
+			"String equals simple positive",
+			&pb.SearchFields{
+				StringArgs: map[string]string{
+					"field": "value",
+				},
+			},
+			&pb.Pool{
+				StringEqualsFilters: []*pb.StringEqualsFilter{
+					{
+						StringArg: "field",
+						Value:     "value",
+					},
+				},
+			},
+		},
+
+		{
+			"TagPresent simple positive",
+			&pb.SearchFields{
+				Tags: []string{
+					"mytag",
+				},
+			},
+			&pb.Pool{
+				TagPresentFilters: []*pb.TagPresentFilter{
+					{
+						Tag: "mytag",
+					},
+				},
+			},
+		},
+
+		{
+			"TagPresent multiple all present",
+			&pb.SearchFields{
+				Tags: []string{
+					"A", "B", "C",
+				},
+			},
+			&pb.Pool{
+				TagPresentFilters: []*pb.TagPresentFilter{
+					{
+						Tag: "A",
+					},
+					{
+						Tag: "C",
+					},
+					{
+						Tag: "B",
+					},
+				},
+			},
+		},
+
+		multipleFilters(true, true, true),
+
+		{
+			"CreatedBefore simple positive",
+			nil,
+			&pb.Pool{
+				CreatedBefore: timestamp(now.Add(time.Hour * 1)),
+			},
+		},
+		{
+			"CreatedAfter simple positive",
+			nil,
+			&pb.Pool{
+				CreatedAfter: timestamp(now.Add(time.Hour * -1)),
+			},
+		},
+		{
+			"Between CreatedBefore and CreatedAfter positive",
+			nil,
+			&pb.Pool{
+				CreatedBefore: timestamp(now.Add(time.Hour * 1)),
+				CreatedAfter:  timestamp(now.Add(time.Hour * -1)),
+			},
+		},
+		{
+			"No time search criteria positive",
+			nil,
+			&pb.Pool{},
+		},
 	}
 }
 
 // ExcludedTestCases returns a list of test cases where using the given filter,
 // the ticket is NOT included in the result.
 func ExcludedTestCases() []TestCase {
+	now := time.Now()
 	return []TestCase{
 		{
-			"missingField",
-			&pb.Ticket{
-				// Using struct literals without helper for degenerate cases only.
-				Properties: &structpb.Struct{
-					Fields: map[string]*structpb.Value{},
+			"DoubleRange no SearchFields",
+			nil,
+			&pb.Pool{
+				DoubleRangeFilters: []*pb.DoubleRangeFilter{
+					{
+						DoubleArg: "field",
+						Min:       math.Inf(-1),
+						Max:       math.Inf(1),
+					},
 				},
 			},
-			&pb.Filter{
-				Attribute: "field",
-				Min:       5,
-				Max:       5,
+		},
+		{
+			"StringEquals no SearchFields",
+			nil,
+			&pb.Pool{
+				StringEqualsFilters: []*pb.StringEqualsFilter{
+					{
+						StringArg: "field",
+						Value:     "value",
+					},
+				},
+			},
+		},
+		{
+			"TagPresent no SearchFields",
+			nil,
+			&pb.Pool{
+				TagPresentFilters: []*pb.TagPresentFilter{
+					{
+						Tag: "value",
+					},
+				},
+			},
+		},
+		{
+			"double range missing field",
+			&pb.SearchFields{
+				DoubleArgs: map[string]float64{
+					"otherfield": 0,
+				},
+			},
+			&pb.Pool{
+				DoubleRangeFilters: []*pb.DoubleRangeFilter{
+					{
+						DoubleArg: "field",
+						Min:       math.Inf(-1),
+						Max:       math.Inf(1),
+					},
+				},
+			},
+		},
+
+		simpleDoubleRange("exactMatch", 5, 5, 5, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("exactMatch", 5, 5, 5, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("exactMatch", 5, 5, 5, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("valueTooLow", -1, 0, 10, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("valueTooLow", -1, 0, 10, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("valueTooLow", -1, 0, 10, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("valueTooLow", -1, 0, 10, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("valueTooHigh", 11, 0, 10, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("valueTooHigh", 11, 0, 10, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("valueTooHigh", 11, 0, 10, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("valueTooHigh", 11, 0, 10, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("minIsNan", 5, math.NaN(), 10, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("minIsNan", 5, math.NaN(), 10, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("minIsNan", 5, math.NaN(), 10, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("minIsNan", 5, math.NaN(), 10, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("maxIsNan", 5, 0, math.NaN(), pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("maxIsNan", 5, 0, math.NaN(), pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("maxIsNan", 5, 0, math.NaN(), pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("maxIsNan", 5, 0, math.NaN(), pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("minMaxAreNan", 5, math.NaN(), math.NaN(), pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("minMaxAreNan", 5, math.NaN(), math.NaN(), pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("minMaxAreNan", 5, math.NaN(), math.NaN(), pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("minMaxAreNan", 5, math.NaN(), math.NaN(), pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("valueIsNan", math.NaN(), 0, 10, pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("valueIsNan", math.NaN(), 0, 10, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("valueIsNan", math.NaN(), 0, 10, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("valueIsNan", math.NaN(), 0, 10, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("valueIsNanInfRange", math.NaN(), math.Inf(-1), math.Inf(1), pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("valueIsNanInfRange", math.NaN(), math.Inf(-1), math.Inf(1), pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("valueIsNanInfRange", math.NaN(), math.Inf(-1), math.Inf(1), pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("valueIsNanInfRange", math.NaN(), math.Inf(-1), math.Inf(1), pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("infinityMax", math.Inf(1), 0, math.Inf(1), pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("infinityMax", math.Inf(1), 0, math.Inf(1), pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("infinityMin", math.Inf(-1), math.Inf(-1), 0, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("infinityMin", math.Inf(-1), math.Inf(-1), 0, pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("allAreNan", math.NaN(), math.NaN(), math.NaN(), pb.DoubleRangeFilter_NONE),
+		simpleDoubleRange("allAreNan", math.NaN(), math.NaN(), math.NaN(), pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("allAreNan", math.NaN(), math.NaN(), math.NaN(), pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("allAreNan", math.NaN(), math.NaN(), math.NaN(), pb.DoubleRangeFilter_BOTH),
+
+		simpleDoubleRange("valueIsMax", 1, 0, 1, pb.DoubleRangeFilter_MAX),
+		simpleDoubleRange("valueIsMin", 0, 0, 1, pb.DoubleRangeFilter_MIN),
+		simpleDoubleRange("excludeBoth", 0, 0, 1, pb.DoubleRangeFilter_BOTH),
+		simpleDoubleRange("excludeBoth", 1, 0, 1, pb.DoubleRangeFilter_BOTH),
+
+		{
+			"String equals simple negative", // and case sensitivity
+			&pb.SearchFields{
+				StringArgs: map[string]string{
+					"field": "value",
+				},
+			},
+			&pb.Pool{
+				StringEqualsFilters: []*pb.StringEqualsFilter{
+					{
+						StringArg: "field",
+						Value:     "VALUE",
+					},
+				},
 			},
 		},
 
 		{
-			"missingFieldsMap",
-			&pb.Ticket{
-				// Using struct literals without helper for degenerate cases only.
-				Properties: &structpb.Struct{
-					Fields: nil,
+			"String equals missing field",
+			&pb.SearchFields{
+				StringArgs: map[string]string{
+					"otherfield": "othervalue",
 				},
 			},
-			&pb.Filter{
-				Attribute: "field",
-				Min:       5,
-				Max:       5,
+			&pb.Pool{
+				StringEqualsFilters: []*pb.StringEqualsFilter{
+					{
+						StringArg: "field",
+						Value:     "value",
+					},
+				},
 			},
 		},
 
 		{
-			"missingProperties",
-			&pb.Ticket{
-				// Using struct literals without helper for degenerate cases only.
-				Properties: nil,
+			"TagPresent simple negative", // and case sensitivity
+			&pb.SearchFields{
+				Tags: []string{
+					"MYTAG",
+				},
 			},
-			&pb.Filter{
-				Attribute: "field",
-				Min:       5,
-				Max:       5,
+			&pb.Pool{
+				TagPresentFilters: []*pb.TagPresentFilter{
+					{
+						Tag: "mytag",
+					},
+				},
 			},
 		},
 
-		simpleRangeTest("valueTooLow", -1, 0, 10),
-		simpleRangeTest("valueTooHigh", 11, 0, 10),
-		simpleRangeTest("minIsNan", 5, math.NaN(), 10),
-		simpleRangeTest("maxIsNan", 5, 0, math.NaN()),
-		simpleRangeTest("valueIsNan", math.NaN(), 0, 10),
+		{
+			"TagPresent multiple with one missing",
+			&pb.SearchFields{
+				Tags: []string{
+					"A", "B", "C",
+				},
+			},
+			&pb.Pool{
+				TagPresentFilters: []*pb.TagPresentFilter{
+					{
+						Tag: "A",
+					},
+					{
+						Tag: "D",
+					},
+					{
+						Tag: "C",
+					},
+				},
+			},
+		},
+
+		{
+			"CreatedBefore simple negative",
+			nil,
+			&pb.Pool{
+				CreatedBefore: timestamp(now.Add(time.Hour * -1)),
+			},
+		},
+		{
+			"CreatedAfter simple negative",
+			nil,
+			&pb.Pool{
+				CreatedAfter: timestamp(now.Add(time.Hour * 1)),
+			},
+		},
+		{
+			"Created before time range negative",
+			nil,
+			&pb.Pool{
+				CreatedBefore: timestamp(now.Add(time.Hour * 2)),
+				CreatedAfter:  timestamp(now.Add(time.Hour * 1)),
+			},
+		},
+		{
+			"Created after time range negative",
+			nil,
+			&pb.Pool{
+				CreatedBefore: timestamp(now.Add(time.Hour * -1)),
+				CreatedAfter:  timestamp(now.Add(time.Hour * -2)),
+			},
+		},
+
+		multipleFilters(false, true, true),
+		multipleFilters(true, false, true),
+		multipleFilters(true, true, false),
 	}
 }
 
-func simpleRangeTest(name string, value, min, max float64) TestCase {
+func simpleDoubleRange(name string, value, min, max float64, exclude pb.DoubleRangeFilter_Exclude) TestCase {
 	return TestCase{
-		name,
-		&pb.Ticket{
-			Properties: structs.Struct{
-				"field": structs.Number(value),
-			}.S(),
+		"double range " + name,
+		&pb.SearchFields{
+			DoubleArgs: map[string]float64{
+				"field": value,
+			},
 		},
-		&pb.Filter{
-			Attribute: "field",
-			Min:       min,
-			Max:       max,
+		&pb.Pool{
+			DoubleRangeFilters: []*pb.DoubleRangeFilter{
+				{
+					DoubleArg: "field",
+					Min:       min,
+					Max:       max,
+					Exclude:   exclude,
+				},
+			},
 		},
 	}
+}
+
+func multipleFilters(doubleRange, stringEquals, tagPresent bool) TestCase {
+	a := float64(0)
+	if !doubleRange {
+		a = 10
+	}
+
+	b := "hi"
+	if !stringEquals {
+		b = "bye"
+	}
+
+	c := "yo"
+	if !tagPresent {
+		c = "cya"
+	}
+
+	return TestCase{
+		fmt.Sprintf("multiplefilters: %v, %v, %v", doubleRange, stringEquals, tagPresent),
+		&pb.SearchFields{
+			DoubleArgs: map[string]float64{
+				"a": a,
+			},
+			StringArgs: map[string]string{
+				"b": b,
+			},
+			Tags: []string{c},
+		},
+		&pb.Pool{
+			DoubleRangeFilters: []*pb.DoubleRangeFilter{
+				{
+					DoubleArg: "a",
+					Min:       -1,
+					Max:       1,
+				},
+			},
+			StringEqualsFilters: []*pb.StringEqualsFilter{
+				{
+					StringArg: "b",
+					Value:     "hi",
+				},
+			},
+			TagPresentFilters: []*pb.TagPresentFilter{
+				{
+					Tag: "yo",
+				},
+			},
+		},
+	}
+}
+
+func timestamp(t time.Time) *tspb.Timestamp {
+	tsp, err := ptypes.TimestampProto(t)
+	if err != nil {
+		panic(err)
+	}
+
+	return tsp
 }

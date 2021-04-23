@@ -18,15 +18,15 @@ import "time"
 
 const (
 	// PoolMaxIdle is the number of maximum idle redis connections in a redis pool
-	PoolMaxIdle = 10
+	PoolMaxIdle = 5
 	// PoolMaxActive is the number of maximum active redis connections in a redis pool
-	PoolMaxActive = 10
+	PoolMaxActive = 5
 	// PoolIdleTimeout is the idle duration allowance of a redis connection a a redis pool
 	PoolIdleTimeout = 10 * time.Second
 	// PoolHealthCheckTimeout is the read/write timeout of a healthcheck HTTP request
 	PoolHealthCheckTimeout = 100 * time.Millisecond
-	// IgnoreListTTL is the time to live duration of Open Match ignore list settings
-	IgnoreListTTL = 500 * time.Millisecond
+	// pendingReleaseTimeout is the time to live duration of Open Match pending release settings
+	pendingReleaseTimeout = 500 * time.Millisecond
 	// InitialInterval is the initial backoff time of a backoff strategy
 	InitialInterval = 30 * time.Millisecond
 	// RandFactor is the randomization factor of a backoff strategy
@@ -36,5 +36,6 @@ const (
 	// MaxInterval is the maximum retry interval of a backoff strategy
 	MaxInterval = 300 * time.Millisecond
 	// MaxElapsedTime is the maximum total retry time of a backoff stragegy
-	MaxElapsedTime = 1000 * time.Millisecond
+	MaxElapsedTime        = 1000 * time.Millisecond
+	assignedDeleteTimeout = 200 * time.Millisecond
 )

@@ -17,102 +17,101 @@ package filter
 import (
 	"testing"
 
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/timestamp"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"open-match.dev/open-match/internal/filter/testcases"
 	"open-match.dev/open-match/pkg/pb"
-	"open-match.dev/open-match/pkg/structs"
 )
 
-// Only test Filter and InFilters for general use cases, not specific scenearios
-// on a filter/property interaction.  Filter and InFilters defer to InFilter for
-// all specific Filter and Ticket Property interaction.
+func TestMeetsCriteria(t *testing.T) {
+	testInclusion := func(t *testing.T, pool *pb.Pool, entity filteredEntity) {
+		pf, err := NewPoolFilter(pool)
 
-func TestFilter(t *testing.T) {
-	tickets := []*pb.Ticket{
-		{
-			Id: "good",
-			Properties: structs.Struct{
-				"field1": structs.Number(5),
-				"field2": structs.Number(5),
-			}.S(),
-		},
+		require.NoError(t, err)
+		require.NotNil(t, pf)
 
-		{
-			Id: "first_bad",
-			Properties: structs.Struct{
-				"field1": structs.Number(-5),
-				"field2": structs.Number(5),
-			}.S(),
-		},
-
-		{
-			Id: "second_bad",
-			Properties: structs.Struct{
-				"field1": structs.Number(5),
-				"field2": structs.Number(-5),
-			}.S(),
-		},
-
-		{
-			Id: "both_bad",
-			Properties: structs.Struct{
-				"field1": structs.Number(-5),
-				"field2": structs.Number(-5),
-			}.S(),
-		},
+		if !pf.In(entity) {
+			t.Error("entity should be included in the pool")
+		}
 	}
 
-	filters := []*pb.Filter{
-		{
-			Attribute: "field1",
-			Min:       0,
-			Max:       10,
-		},
-		{
-			Attribute: "field2",
-			Min:       0,
-			Max:       10,
-		},
-	}
-
-	result := Filter(tickets, filters)
-
-	if len(result) != 1 {
-		t.Fatalf("Expected exactly 1 ticket to pass filters, got %d", len(result))
-	}
-
-	if result[0].Id != "good" {
-		t.Fatalf("Expected ticket id good, got %s", result[0].Id)
-	}
-}
-
-func TestInFilters(t *testing.T) {
-	ticket := &pb.Ticket{
-		Id: "good",
-	}
-
-	filters := []*pb.Filter{}
-
-	passed := InFilters(ticket, filters)
-
-	if !passed {
-		t.Fatal("No filters should allow all tickets")
-	}
-}
-
-func TestInFilter(t *testing.T) {
-	for _, tt := range testcases.IncludedTestCases() {
-		t.Run(tt.Name, func(t *testing.T) {
-			if !InFilter(tt.Ticket, tt.Filter) {
-				t.Error("Ticket should be included in filter.")
-			}
+	for _, tc := range testcases.IncludedTestCases() {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			testInclusion(t, tc.Pool, &pb.Ticket{
+				SearchFields: tc.SearchFields,
+				CreateTime:   ptypes.TimestampNow(),
+			})
+			testInclusion(t, tc.Pool, &pb.Backfill{
+				SearchFields: tc.SearchFields,
+				CreateTime:   ptypes.TimestampNow(),
+			})
 		})
 	}
 
-	for _, tt := range testcases.ExcludedTestCases() {
-		t.Run(tt.Name, func(t *testing.T) {
-			if InFilter(tt.Ticket, tt.Filter) {
-				t.Error("Ticket should be excluded from filter.")
-			}
+	testExclusion := func(t *testing.T, pool *pb.Pool, entity filteredEntity) {
+		pf, err := NewPoolFilter(pool)
+
+		require.NoError(t, err)
+		require.NotNil(t, pf)
+
+		if pf.In(entity) {
+			t.Error("ticket should be excluded from the pool")
+		}
+	}
+
+	for _, tc := range testcases.ExcludedTestCases() {
+		tc := tc
+		t.Run(tc.Name, func(t *testing.T) {
+			testExclusion(t, tc.Pool, &pb.Ticket{
+				SearchFields: tc.SearchFields,
+				CreateTime:   ptypes.TimestampNow(),
+			})
+			testExclusion(t, tc.Pool, &pb.Backfill{
+				SearchFields: tc.SearchFields,
+				CreateTime:   ptypes.TimestampNow(),
+			})
+		})
+	}
+}
+
+func TestValidPoolFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pool *pb.Pool
+		code codes.Code
+		msg  string
+	}{
+		{
+			"invalid create before",
+			&pb.Pool{
+				CreatedBefore: &timestamp.Timestamp{Nanos: -1},
+			},
+			codes.InvalidArgument,
+			".invalid created_before value",
+		},
+		{
+			"invalid create after",
+			&pb.Pool{
+				CreatedAfter: &timestamp.Timestamp{Nanos: -1},
+			},
+			codes.InvalidArgument,
+			".invalid created_after value",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			pf, err := NewPoolFilter(tc.pool)
+
+			require.Error(t, err)
+			require.Nil(t, pf)
+
+			s := status.Convert(err)
+			require.Equal(t, tc.code, s.Code())
+			require.Equal(t, tc.msg, s.Message())
 		})
 	}
 }

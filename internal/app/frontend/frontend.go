@@ -15,49 +15,63 @@
 package frontend
 
 import (
-	"github.com/sirupsen/logrus"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/stats/view"
 	"google.golang.org/grpc"
-	"open-match.dev/open-match/internal/config"
-	"open-match.dev/open-match/internal/rpc"
+	"open-match.dev/open-match/internal/appmain"
 	"open-match.dev/open-match/internal/statestore"
+	"open-match.dev/open-match/internal/telemetry"
 	"open-match.dev/open-match/pkg/pb"
 )
 
-// RunApplication creates a server.
-func RunApplication() {
-	cfg, err := config.Read()
-	if err != nil {
-		logger.WithFields(logrus.Fields{
-			"error": err.Error(),
-		}).Fatalf("cannot read configuration.")
-	}
-	p, err := rpc.NewServerParamsFromConfig(cfg, "api.frontend")
-	if err != nil {
-		logger.WithFields(logrus.Fields{
-			"error": err.Error(),
-		}).Fatalf("cannot construct server.")
-	}
+var (
+	totalBytesPerTicket     = stats.Int64("open-match.dev/frontend/total_bytes_per_ticket", "Total bytes per ticket", stats.UnitBytes)
+	searchFieldsPerTicket   = stats.Int64("open-match.dev/frontend/searchfields_per_ticket", "Searchfields per ticket", stats.UnitDimensionless)
+	totalBytesPerBackfill   = stats.Int64("open-match.dev/frontend/total_bytes_per_backfill", "Total bytes per backfill", stats.UnitBytes)
+	searchFieldsPerBackfill = stats.Int64("open-match.dev/frontend/searchfields_per_backfill", "Searchfields per backfill", stats.UnitDimensionless)
 
-	if err := BindService(p, cfg); err != nil {
-		logger.WithFields(logrus.Fields{
-			"error": err.Error(),
-		}).Fatalf("failed to bind frontend service.")
+	totalBytesPerTicketView = &view.View{
+		Measure:     totalBytesPerTicket,
+		Name:        "open-match.dev/frontend/total_bytes_per_ticket",
+		Description: "Total bytes per ticket",
+		Aggregation: telemetry.DefaultBytesDistribution,
 	}
-
-	rpc.MustServeForever(p)
-}
+	searchFieldsPerTicketView = &view.View{
+		Measure:     searchFieldsPerTicket,
+		Name:        "open-match.dev/frontend/searchfields_per_ticket",
+		Description: "SearchFields per ticket",
+		Aggregation: telemetry.DefaultCountDistribution,
+	}
+	totalBytesPerBackfillView = &view.View{
+		Measure:     totalBytesPerBackfill,
+		Name:        "open-match.dev/frontend/total_bytes_per_backfill",
+		Description: "Total bytes per backfill",
+		Aggregation: telemetry.DefaultBytesDistribution,
+	}
+	searchFieldsPerBackfillView = &view.View{
+		Measure:     searchFieldsPerBackfill,
+		Name:        "open-match.dev/frontend/searchfields_per_backfill",
+		Description: "SearchFields per backfill",
+		Aggregation: telemetry.DefaultCountDistribution,
+	}
+)
 
 // BindService creates the frontend service and binds it to the serving harness.
-func BindService(p *rpc.ServerParams, cfg config.View) error {
+func BindService(p *appmain.Params, b *appmain.Bindings) error {
 	service := &frontendService{
-		cfg:   cfg,
-		store: statestore.New(cfg),
+		cfg:   p.Config(),
+		store: statestore.New(p.Config()),
 	}
 
-	p.AddHealthCheckFunc(service.store.HealthCheck)
-	p.AddHandleFunc(func(s *grpc.Server) {
-		pb.RegisterFrontendServer(s, service)
-	}, pb.RegisterFrontendHandlerFromEndpoint)
-
+	b.AddHealthCheckFunc(service.store.HealthCheck)
+	b.AddHandleFunc(func(s *grpc.Server) {
+		pb.RegisterFrontendServiceServer(s, service)
+	}, pb.RegisterFrontendServiceHandlerFromEndpoint)
+	b.RegisterViews(
+		totalBytesPerTicketView,
+		searchFieldsPerTicketView,
+		totalBytesPerBackfillView,
+		searchFieldsPerBackfillView,
+	)
 	return nil
 }

@@ -18,21 +18,27 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"time"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
+	grpc_tracing "github.com/grpc-ecosystem/go-grpc-middleware/tracing/opentracing"
 	grpc_validator "github.com/grpc-ecosystem/go-grpc-middleware/validator"
-	"github.com/grpc-ecosystem/grpc-gateway/runtime"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/plugin/ochttp"
+	"go.opencensus.io/plugin/ochttp/propagation/b3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"open-match.dev/open-match/internal/config"
-	"open-match.dev/open-match/internal/monitoring"
-	"open-match.dev/open-match/internal/signal"
-	"open-match.dev/open-match/internal/util/netlistener"
+	"open-match.dev/open-match/internal/logging"
+	"open-match.dev/open-match/internal/telemetry"
 )
 
 const (
@@ -63,8 +69,8 @@ type ServerParams struct {
 	handlersForGrpcProxy   []GrpcProxyHandler
 	handlersForHealthCheck []func(context.Context) error
 
-	grpcListener      *netlistener.ListenerHolder
-	grpcProxyListener *netlistener.ListenerHolder
+	grpcListener      net.Listener
+	grpcProxyListener net.Listener
 
 	// Root CA public certificate in PEM format.
 	rootCaPublicCertificateFileData []byte
@@ -74,29 +80,30 @@ type ServerParams struct {
 	// Private key in PEM format.
 	privateKeyFileData []byte
 
-	enableRPCLogging bool
-	enableMetrics    bool
+	enableRPCLogging        bool
+	enableRPCPayloadLogging bool
+	enableMetrics           bool
 }
 
 // NewServerParamsFromConfig returns server Params initialized from the configuration file.
-func NewServerParamsFromConfig(cfg config.View, prefix string) (*ServerParams, error) {
-	grpcLh, err := netlistener.NewFromPortNumber(cfg.GetInt(prefix + ".grpcport"))
+func NewServerParamsFromConfig(cfg config.View, prefix string, listen func(network, address string) (net.Listener, error)) (*ServerParams, error) {
+	serverLogger = logrus.WithFields(logrus.Fields{
+		"app":       "openmatch",
+		"component": prefix,
+	})
+
+	grpcL, err := listen("tcp", fmt.Sprintf(":%d", cfg.GetInt(prefix+".grpcport")))
 	if err != nil {
-		serverLogger.Fatal(err)
-		return nil, err
+		return nil, errors.Wrap(err, "can't start listener for grpc")
 	}
-	httpLh, err := netlistener.NewFromPortNumber(cfg.GetInt(prefix + ".httpport"))
+	httpL, err := listen("tcp", fmt.Sprintf(":%d", cfg.GetInt(prefix+".httpport")))
 	if err != nil {
-		closeErr := grpcLh.Close()
-		if closeErr != nil {
-			serverLogger.WithFields(logrus.Fields{
-				"error": closeErr.Error(),
-			}).Info("failed to gRPC close port")
-		}
-		serverLogger.Fatal(err)
-		return nil, err
+		surpressedErr := grpcL.Close() // Don't care about additional errors when stopping.
+		_ = surpressedErr
+		return nil, errors.Wrap(err, "can't start listener for http")
 	}
-	p := NewServerParamsFromListeners(grpcLh, httpLh)
+
+	p := NewServerParamsFromListeners(grpcL, httpL)
 
 	certFile := cfg.GetString(configNameServerPublicCertificateFile)
 	privateKeyFile := cfg.GetString(configNameServerPrivateKeyFile)
@@ -127,22 +134,21 @@ func NewServerParamsFromConfig(cfg config.View, prefix string) (*ServerParams, e
 		p.SetTLSConfiguration(rootPublicCertData, publicCertData, privateKeyData)
 	}
 
-	p.enableMetrics = cfg.GetBool(monitoring.ConfigNameEnableMetrics)
-	p.enableRPCLogging = cfg.GetBool(configNameEnableRPCLogging)
-	// TODO: This isn't ideal since monitoring requires config for it to be initialized.
-	// This forces us to initialize readiness probes earlier than necessary.
-	monitoring.Setup(p.ServeMux, cfg)
+	p.enableMetrics = cfg.GetBool(telemetry.ConfigNameEnableMetrics)
+	p.enableRPCLogging = cfg.GetBool(ConfigNameEnableRPCLogging)
+	p.enableRPCPayloadLogging = logging.IsDebugEnabled(cfg)
+
 	return p, nil
 }
 
 // NewServerParamsFromListeners returns server Params initialized with the ListenerHolder variables.
-func NewServerParamsFromListeners(grpcLh *netlistener.ListenerHolder, proxyLh *netlistener.ListenerHolder) *ServerParams {
+func NewServerParamsFromListeners(grpcL net.Listener, proxyL net.Listener) *ServerParams {
 	return &ServerParams{
 		ServeMux:             http.NewServeMux(),
 		handlersForGrpc:      []GrpcHandler{},
 		handlersForGrpcProxy: []GrpcProxyHandler{},
-		grpcListener:         grpcLh,
-		grpcProxyListener:    proxyLh,
+		grpcListener:         grpcL,
+		grpcProxyListener:    proxyL,
 	}
 }
 
@@ -197,12 +203,12 @@ type Server struct {
 
 // grpcServerWithProxy this will go away when insecure.go and tls.go are merged into the same server.
 type grpcServerWithProxy interface {
-	start(*ServerParams) (func(), error)
-	stop()
+	start(*ServerParams) error
+	stop() error
 }
 
 // Start the gRPC+HTTP(s) REST server.
-func (s *Server) Start(p *ServerParams) (func(), error) {
+func (s *Server) Start(p *ServerParams) error {
 	if p.usingTLS() {
 		s.serverWithProxy = newTLSServer(p.grpcListener, p.grpcProxyListener)
 	} else {
@@ -212,44 +218,44 @@ func (s *Server) Start(p *ServerParams) (func(), error) {
 }
 
 // Stop the gRPC+HTTP(s) REST server.
-func (s *Server) Stop() {
-	s.serverWithProxy.stop()
+func (s *Server) Stop() error {
+	return s.serverWithProxy.stop()
 }
 
-// startServingIndefinitely creates a server based on the params and begins serving the gRPC and HTTP proxy.
-// It returns waitUntilKilled() which will wait indefinitely until crash or Ctrl+C is pressed.
-// forceStopServingFunc() is also returned which is used to force kill the server for tests.
-func startServingIndefinitely(params *ServerParams) (func(), func(), error) {
-	s := &Server{}
-
-	// Start serving traffic.
-	waitForStart, err := s.Start(params)
-	if err != nil {
-		serverLogger.WithFields(logrus.Fields{
-			"error": err.Error(),
-		}).Fatal("Failed to start gRPC and HTTP servers.")
-		return func() {}, func() {}, err
-	}
-	serverLogger.Info("Server has started.")
-	// Exit when we see a signal
-	waitUntilKilled, forceStopServingFunc := signal.New()
-
-	waitForStart()
-	serveUntilKilledFunc := func() {
-		waitUntilKilled()
-		s.Stop()
-		serverLogger.Info("Shutting down server")
-	}
-	return serveUntilKilledFunc, forceStopServingFunc, nil
+type loggingHTTPHandler struct {
+	handler     http.Handler
+	logPayloads bool
 }
 
-// MustServeForever is a convenience method for starting a server and running it indefinitely.
-func MustServeForever(params *ServerParams) {
-	serveUntilKilledFunc, _, err := startServingIndefinitely(params)
-	if err != nil {
-		return
+func (l *loggingHTTPHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	dumpReqLog, dumpReqErr := httputil.DumpRequest(req, l.logPayloads)
+	fields := logrus.Fields{
+		"method": req.Method,
+		"url":    req.URL,
+		"proto":  req.Proto,
 	}
-	serveUntilKilledFunc()
+	if dumpReqErr == nil {
+		serverLogger.WithFields(fields).Debug(string(dumpReqLog))
+	} else {
+		serverLogger.WithError(dumpReqErr).WithFields(fields).Debug("cannot dump request")
+	}
+	l.handler.ServeHTTP(w, req)
+}
+
+func instrumentHTTPHandler(handler http.Handler, params *ServerParams) http.Handler {
+	if params.enableMetrics {
+		handler = &ochttp.Handler{
+			Handler:     handler,
+			Propagation: &b3.HTTPFormat{},
+		}
+	}
+	if params.enableRPCLogging {
+		handler = &loggingHTTPHandler{
+			handler:     handler,
+			logPayloads: params.enableRPCPayloadLogging,
+		}
+	}
+	return handler
 }
 
 func newGRPCServerOptions(params *ServerParams) []grpc.ServerOption {
@@ -257,19 +263,33 @@ func newGRPCServerOptions(params *ServerParams) []grpc.ServerOption {
 	si := []grpc.StreamServerInterceptor{
 		grpc_recovery.StreamServerInterceptor(),
 		grpc_validator.StreamServerInterceptor(),
+		grpc_tracing.StreamServerInterceptor(),
 	}
 	ui := []grpc.UnaryServerInterceptor{
 		grpc_recovery.UnaryServerInterceptor(),
 		grpc_validator.UnaryServerInterceptor(),
+		grpc_tracing.UnaryServerInterceptor(),
 	}
 	if params.enableRPCLogging {
 		grpcLogger := logrus.WithFields(logrus.Fields{
 			"app":       "openmatch",
 			"component": "grpc.server",
 		})
-		si = append(si, grpc_logrus.StreamServerInterceptor(grpcLogger))
-		ui = append(ui, grpc_logrus.UnaryServerInterceptor(grpcLogger))
+		grpcLogger.Level = logrus.DebugLevel
+		if params.enableRPCPayloadLogging {
+			logEverythingFromServer := func(_ context.Context, _ string, _ interface{}) bool {
+				return true
+			}
+			si = append(si, grpc_logrus.PayloadStreamServerInterceptor(grpcLogger, logEverythingFromServer))
+			ui = append(ui, grpc_logrus.PayloadUnaryServerInterceptor(grpcLogger, logEverythingFromServer))
+		} else {
+			si = append(si, grpc_logrus.StreamServerInterceptor(grpcLogger))
+			ui = append(ui, grpc_logrus.UnaryServerInterceptor(grpcLogger))
+		}
 	}
+
+	ui = append(ui, serverUnaryInterceptor)
+	si = append(si, serverStreamInterceptor)
 
 	if params.enableMetrics {
 		opts = append(opts, grpc.StatsHandler(&ocgrpc.ServerHandler{}))
@@ -277,5 +297,33 @@ func newGRPCServerOptions(params *ServerParams) []grpc.ServerOption {
 
 	return append(opts,
 		grpc.StreamInterceptor(grpc_middleware.ChainStreamServer(si...)),
-		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(ui...)))
+		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(ui...)),
+		grpc.KeepaliveEnforcementPolicy(
+			keepalive.EnforcementPolicy{
+				MinTime:             10 * time.Second,
+				PermitWithoutStream: true,
+			},
+		))
+}
+
+func serverStreamInterceptor(srv interface{},
+	stream grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler) error {
+	err := handler(srv, stream)
+	if err != nil {
+		serverLogger.Error(err)
+	}
+	return err
+}
+
+func serverUnaryInterceptor(ctx context.Context,
+	req interface{},
+	info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (interface{}, error) {
+	h, err := handler(ctx, req)
+	if err != nil {
+		serverLogger.Error(err)
+	}
+	return h, err
 }

@@ -1,4 +1,5 @@
 // +build !e2ecluster
+
 // Copyright 2019 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,162 +17,76 @@
 package e2e
 
 import (
-	"context"
+	"net"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/Bose/minisentinel"
+	miniredis "github.com/alicebob/miniredis/v2"
 	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
-	simple "open-match.dev/open-match/examples/evaluator/golang/simple/evaluate"
-	pool "open-match.dev/open-match/examples/functions/golang/pool/mmf"
+	"open-match.dev/open-match/internal/app/evaluator"
 	"open-match.dev/open-match/internal/app/minimatch"
+	"open-match.dev/open-match/internal/appmain/apptest"
+	"open-match.dev/open-match/internal/config"
 	"open-match.dev/open-match/internal/rpc"
-	rpcTesting "open-match.dev/open-match/internal/rpc/testing"
-	statestoreTesting "open-match.dev/open-match/internal/statestore/testing"
-	evalHarness "open-match.dev/open-match/pkg/harness/evaluator/golang"
-	mmfHarness "open-match.dev/open-match/pkg/harness/function/golang"
-	pb "open-match.dev/open-match/pkg/pb"
+	"open-match.dev/open-match/internal/telemetry"
+	mmfService "open-match.dev/open-match/internal/testing/mmf"
 )
 
-type inmemoryOM struct {
-	mainTc *rpcTesting.TestContext
-	mmfTc  *rpcTesting.TestContext
-	evalTc *rpcTesting.TestContext
-	t      *testing.T
-	mc     *multicloser
-}
-
-func (iom *inmemoryOM) withT(t *testing.T) OM {
-	evalTc := createEvaluatorForTest(t)
-	mainTc := createMinimatchForTest(t, evalTc)
-	mmfTc := createMatchFunctionForTest(t, mainTc)
-
-	om := &inmemoryOM{
-		mainTc: mainTc,
-		mmfTc:  mmfTc,
-		evalTc: evalTc,
-		t:      t,
-		mc:     newMulticloser(),
+func start(t *testing.T, eval evaluator.Evaluator, mmf mmfService.MatchFunction) (config.View, func(time.Duration)) {
+	mredis := miniredis.NewMiniRedis()
+	err := mredis.StartAddr("localhost:0")
+	if err != nil {
+		t.Fatalf("failed to start miniredis, %v", err)
 	}
-	return om
-}
+	t.Cleanup(mredis.Close)
 
-func createZygote(m *testing.M) (OM, error) {
-	return &inmemoryOM{}, nil
-}
-
-func (iom *inmemoryOM) MustFrontendGRPC() pb.FrontendClient {
-	conn := iom.mainTc.MustGRPC()
-	iom.mc.addSilent(conn.Close)
-	return pb.NewFrontendClient(conn)
-}
-
-func (iom *inmemoryOM) MustBackendGRPC() pb.BackendClient {
-	conn := iom.mainTc.MustGRPC()
-	iom.mc.addSilent(conn.Close)
-	return pb.NewBackendClient(conn)
-}
-
-func (iom *inmemoryOM) MustMmLogicGRPC() pb.MmLogicClient {
-	conn := iom.mainTc.MustGRPC()
-	iom.mc.addSilent(conn.Close)
-	return pb.NewMmLogicClient(conn)
-}
-
-func (iom *inmemoryOM) MustMmfConfigGRPC() *pb.FunctionConfig {
-	return &pb.FunctionConfig{
-		Host: iom.mmfTc.GetHostname(),
-		Port: int32(iom.mmfTc.GetGRPCPort()),
-		Type: pb.FunctionConfig_GRPC,
+	msentinal := minisentinel.NewSentinel(mredis)
+	err = msentinal.StartAddr("localhost:0")
+	if err != nil {
+		t.Fatalf("failed to start minisentinel, %v", err)
 	}
-}
+	t.Cleanup(msentinal.Close)
 
-func (iom *inmemoryOM) MustMmfConfigHTTP() *pb.FunctionConfig {
-	return &pb.FunctionConfig{
-		Host: iom.mmfTc.GetHostname(),
-		Port: int32(iom.mmfTc.GetHTTPPort()),
-		Type: pb.FunctionConfig_REST,
+	grpcListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	_, grpcPort, err := net.SplitHostPort(grpcListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, httpPort, err := net.SplitHostPort(httpListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	listeners := []net.Listener{grpcListener, httpListener}
 
-func (iom *inmemoryOM) HealthCheck() error {
-	return nil
-}
-
-func (iom *inmemoryOM) Context() context.Context {
-	return iom.mainTc.Context()
-}
-
-func (iom *inmemoryOM) cleanup() {
-	iom.mc.close()
-	iom.mainTc.Close()
-	iom.mmfTc.Close()
-	iom.evalTc.Close()
-}
-
-func (iom *inmemoryOM) cleanupMain() error {
-	return nil
-}
-
-// Create a minimatch test service with function bindings from frontend, backend, and mmlogic.
-// Instruct this service to start and connect to a fake storage service.
-func createMinimatchForTest(t *testing.T, evalTc *rpcTesting.TestContext) *rpcTesting.TestContext {
-	var closer func()
 	cfg := viper.New()
+	cfg.SetConfigType("yaml")
+	err = cfg.ReadConfig(strings.NewReader(configFile))
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// TODO: Use insecure for now since minimatch and mmf only works with the same secure mode
-	// Server a minimatch for testing using random port at tc.grpcAddress & tc.proxyAddress
-	tc := rpcTesting.MustServeInsecure(t, func(p *rpc.ServerParams) {
-		closer = statestoreTesting.New(t, cfg)
-		cfg.Set("storage.page.size", 10)
-		// Set up the attributes that a ticket will be indexed for.
-		cfg.Set("ticketIndices", Indices)
-		assert.Nil(t, minimatch.BindService(p, cfg))
-	})
-	// TODO: Revisit the Minimatch test setup in future milestone to simplify passing config
-	// values between components. The backend needs to connect to to the synchronizer but when
-	// it is initialized, does not know what port the synchronizer is on. To work around this,
-	// the backend sets up a connection to the synchronizer at runtime and hence can access these
-	// config values to establish the connection.
-	cfg.Set("api.synchronizer.hostname", tc.GetHostname())
-	cfg.Set("api.synchronizer.grpcport", tc.GetGRPCPort())
-	cfg.Set("api.synchronizer.httpport", tc.GetHTTPPort())
-	cfg.Set("synchronizer.registrationIntervalMs", "200ms")
-	cfg.Set("synchronizer.proposalCollectionIntervalMs", "200ms")
-	cfg.Set("api.evaluator.hostname", evalTc.GetHostname())
-	cfg.Set("api.evaluator.grpcport", evalTc.GetGRPCPort())
-	cfg.Set("api.evaluator.httpport", evalTc.GetHTTPPort())
-	cfg.Set("synchronizer.enabled", true)
+	cfg.Set("redis.sentinelHostname", msentinal.Host())
+	cfg.Set("redis.sentinelPort", msentinal.Port())
+	cfg.Set("redis.sentinelMaster", msentinal.MasterInfo().Name)
+	services := []string{apptest.ServiceName, "synchronizer", "backend", "frontend", "query", "evaluator"}
+	for _, name := range services {
+		cfg.Set("api."+name+".hostname", "localhost")
+		cfg.Set("api."+name+".grpcport", grpcPort)
+		cfg.Set("api."+name+".httpport", httpPort)
+	}
+	cfg.Set(rpc.ConfigNameEnableRPCLogging, *testOnlyEnableRPCLoggingFlag)
+	cfg.Set("logging.level", *testOnlyLoggingLevel)
+	cfg.Set(telemetry.ConfigNameEnableMetrics, *testOnlyEnableMetrics)
 
-	// TODO: This is very ugly. Need a better story around closing resources.
-	tc.AddCloseFunc(closer)
-	return tc
-}
-
-// Create a mmf service using a started test server.
-// Inject the port config of mmlogic using that the passed in test server
-func createMatchFunctionForTest(t *testing.T, c *rpcTesting.TestContext) *rpcTesting.TestContext {
-	// TODO: Use insecure for now since minimatch and mmf only works with the same secure mode
-	tc := rpcTesting.MustServeInsecure(t, func(p *rpc.ServerParams) {
-		cfg := viper.New()
-
-		// The below configuration is used by GRPC harness to create an mmlogic client to query tickets.
-		cfg.Set("api.mmlogic.hostname", c.GetHostname())
-		cfg.Set("api.mmlogic.grpcport", c.GetGRPCPort())
-		cfg.Set("api.mmlogic.httpport", c.GetHTTPPort())
-
-		assert.Nil(t, mmfHarness.BindService(p, cfg, &mmfHarness.FunctionSettings{
-			Func: pool.MakeMatches,
-		}))
-	})
-	return tc
-}
-
-// Create an evaluator service that will be used by the minimatch tests.
-func createEvaluatorForTest(t *testing.T) *rpcTesting.TestContext {
-	tc := rpcTesting.MustServeInsecure(t, func(p *rpc.ServerParams) {
-		cfg := viper.New()
-		assert.Nil(t, evalHarness.BindService(p, cfg, simple.Evaluate))
-	})
-
-	return tc
+	apptest.TestApp(t, cfg, listeners, minimatch.BindService, mmfService.BindServiceFor(mmf), evaluator.BindServiceFor(eval))
+	return cfg, mredis.FastForward
 }

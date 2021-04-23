@@ -20,12 +20,11 @@ import (
 	"math/rand"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"open-match.dev/open-match/examples/demo/components"
 	"open-match.dev/open-match/examples/demo/updater"
-	"open-match.dev/open-match/internal/config"
-	"open-match.dev/open-match/internal/rpc"
 	"open-match.dev/open-match/pkg/pb"
-	"open-match.dev/open-match/pkg/structs"
 )
 
 func Run(ds *components.DemoShared) {
@@ -35,7 +34,7 @@ func Run(ds *components.DemoShared) {
 		name := fmt.Sprintf("fakeplayer_%d", i)
 		go func() {
 			for !isContextDone(ds.Ctx) {
-				runScenario(ds.Ctx, ds.Cfg, name, u.ForField(name))
+				runScenario(ds.Ctx, name, u.ForField(name))
 			}
 		}()
 	}
@@ -55,7 +54,7 @@ type status struct {
 	Assignment *pb.Assignment
 }
 
-func runScenario(ctx context.Context, cfg config.View, name string, update updater.SetFunc) {
+func runScenario(ctx context.Context, name string, update updater.SetFunc) {
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -81,12 +80,13 @@ func runScenario(ctx context.Context, cfg config.View, name string, update updat
 	s.Status = "Connecting to Open Match frontend"
 	update(s)
 
-	conn, err := rpc.GRPCClientFromConfig(cfg, "api.frontend")
+	// See https://open-match.dev/site/docs/guides/api/
+	conn, err := grpc.Dial("open-match-frontend.open-match.svc.cluster.local:50504", grpc.WithInsecure())
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
-	fe := pb.NewFrontendClient(conn)
+	fe := pb.NewFrontendServiceClient(conn)
 
 	//////////////////////////////////////////////////////////////////////////////
 	s.Status = "Creating Open Match Ticket"
@@ -95,19 +95,14 @@ func runScenario(ctx context.Context, cfg config.View, name string, update updat
 	var ticketId string
 	{
 		req := &pb.CreateTicketRequest{
-			Ticket: &pb.Ticket{
-				Properties: structs.Struct{
-					"name":      structs.String(name),
-					"mode.demo": structs.Number(1),
-				}.S(),
-			},
+			Ticket: &pb.Ticket{},
 		}
 
 		resp, err := fe.CreateTicket(ctx, req)
 		if err != nil {
 			panic(err)
 		}
-		ticketId = resp.Ticket.Id
+		ticketId = resp.Id
 	}
 
 	//////////////////////////////////////////////////////////////////////////////
@@ -116,11 +111,11 @@ func runScenario(ctx context.Context, cfg config.View, name string, update updat
 
 	var assignment *pb.Assignment
 	{
-		req := &pb.GetAssignmentsRequest{
+		req := &pb.WatchAssignmentsRequest{
 			TicketId: ticketId,
 		}
 
-		stream, err := fe.GetAssignments(ctx, req)
+		stream, err := fe.WatchAssignments(ctx, req)
 		for assignment.GetConnection() == "" {
 			resp, err := stream.Recv()
 			if err != nil {

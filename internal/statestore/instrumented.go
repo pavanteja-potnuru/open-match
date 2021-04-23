@@ -17,20 +17,8 @@ package statestore
 import (
 	"context"
 
-	"open-match.dev/open-match/internal/monitoring"
+	"go.opencensus.io/trace"
 	"open-match.dev/open-match/pkg/pb"
-)
-
-var (
-	mStateStoreCreateTicket           = monitoring.Counter("statestore/createticket", "tickets created")
-	mStateStoreGetTicket              = monitoring.Counter("statestore/getticket", "tickets retrieve")
-	mStateStoreDeleteTicket           = monitoring.Counter("statestore/deleteticket", "tickets deleted")
-	mStateStoreIndexTicket            = monitoring.Counter("statestore/indexticket", "tickets indexed")
-	mStateStoreDeindexTicket          = monitoring.Counter("statestore/deindexticket", "tickets deindexed")
-	mStateStoreFilterTickets          = monitoring.Counter("statestore/filterticket", "tickets that were filtered and returned")
-	mStateStoreUpdateAssignments      = monitoring.Counter("statestore/updateassignment", "tickets assigned")
-	mStateStoreGetAssignments         = monitoring.Counter("statestore/getassignments", "ticket assigned retrieved")
-	mStateStoreAddTicketsToIgnoreList = monitoring.Counter("statestore/addticketstoignorelist", "tickets moved to ignore list")
 )
 
 // instrumentedService is a wrapper for a statestore service that provides instrumentation (metrics and tracing) of the database.
@@ -38,79 +26,174 @@ type instrumentedService struct {
 	s Service
 }
 
-// Close the connection to the database.
 func (is *instrumentedService) Close() error {
 	return is.s.Close()
 }
 
-// HealthCheck indicates if the database is reachable.
 func (is *instrumentedService) HealthCheck(ctx context.Context) error {
 	err := is.s.HealthCheck(ctx)
 	return err
 }
 
-// CreateTicket creates a new Ticket in the state storage. If the id already exists, it will be overwritten.
 func (is *instrumentedService) CreateTicket(ctx context.Context, ticket *pb.Ticket) error {
-	monitoring.IncrementCounter(ctx, mStateStoreCreateTicket)
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.CreateTicket")
+	defer span.End()
 	return is.s.CreateTicket(ctx, ticket)
 }
 
-// GetTicket gets the Ticket with the specified id from state storage. This method fails if the Ticket does not exist.
 func (is *instrumentedService) GetTicket(ctx context.Context, id string) (*pb.Ticket, error) {
-	monitoring.IncrementCounter(ctx, mStateStoreGetTicket)
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetTicket")
+	defer span.End()
 	return is.s.GetTicket(ctx, id)
 }
 
-// DeleteTicket removes the Ticket with the specified id from state storage.
 func (is *instrumentedService) DeleteTicket(ctx context.Context, id string) error {
-	monitoring.IncrementCounter(ctx, mStateStoreDeleteTicket)
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.DeleteTicket")
+	defer span.End()
 	return is.s.DeleteTicket(ctx, id)
 }
 
-// IndexTicket indexes the Ticket id for the configured index fields.
 func (is *instrumentedService) IndexTicket(ctx context.Context, ticket *pb.Ticket) error {
-	monitoring.IncrementCounter(ctx, mStateStoreIndexTicket)
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.IndexTicket")
+	defer span.End()
 	return is.s.IndexTicket(ctx, ticket)
 }
 
-// DeindexTicket removes the indexing for the specified Ticket. Only the indexes are removed but the Ticket continues to exist.
 func (is *instrumentedService) DeindexTicket(ctx context.Context, id string) error {
-	monitoring.IncrementCounter(ctx, mStateStoreDeindexTicket)
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.DeindexTicket")
+	defer span.End()
 	return is.s.DeindexTicket(ctx, id)
 }
 
-// FilterTickets returns the Ticket ids and required attribute key-value pairs for the Tickets meeting the specified filtering criteria.
-// map[ticket.Id]map[attributeName][attributeValue]
-// {
-//  "testplayer1": {"ranking" : 56, "loyalty_level": 4},
-//  "testplayer2": {"ranking" : 50, "loyalty_level": 3},
-// }
-func (is *instrumentedService) FilterTickets(ctx context.Context, filters []*pb.Filter, pageSize int, callback func([]*pb.Ticket) error) error {
-	return is.s.FilterTickets(ctx, filters, pageSize, func(t []*pb.Ticket) error {
-		monitoring.IncrementCounterN(ctx, mStateStoreFilterTickets, len(t))
-		return callback(t)
-	})
+func (is *instrumentedService) GetTickets(ctx context.Context, ids []string) ([]*pb.Ticket, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetTickets")
+	defer span.End()
+	return is.s.GetTickets(ctx, ids)
 }
 
-// UpdateAssignments update the match assignments for the input ticket ids.
-// This function guarantees if any of the input ids does not exists, the state of the storage service won't be altered.
-// However, since Redis does not support transaction roll backs (see https://redis.io/topics/transactions), some of the
-// assignment fields might be partially updated if this function encounters an error halfway through the execution.
-func (is *instrumentedService) UpdateAssignments(ctx context.Context, ids []string, assignment *pb.Assignment) error {
-	monitoring.IncrementCounter(ctx, mStateStoreUpdateAssignments)
-	return is.s.UpdateAssignments(ctx, ids, assignment)
+func (is *instrumentedService) GetIndexedIDSet(ctx context.Context) (map[string]struct{}, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetIndexedIDSet")
+	defer span.End()
+	return is.s.GetIndexedIDSet(ctx)
 }
 
-// GetAssignments returns the assignment associated with the input ticket id
+func (is *instrumentedService) UpdateAssignments(ctx context.Context, req *pb.AssignTicketsRequest) (*pb.AssignTicketsResponse, []*pb.Ticket, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.UpdateAssignments")
+	defer span.End()
+	return is.s.UpdateAssignments(ctx, req)
+}
+
 func (is *instrumentedService) GetAssignments(ctx context.Context, id string, callback func(*pb.Assignment) error) error {
-	return is.s.GetAssignments(ctx, id, func(a *pb.Assignment) error {
-		monitoring.IncrementCounter(ctx, mStateStoreGetAssignments)
-		return callback(a)
-	})
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetAssignments")
+	defer span.End()
+	return is.s.GetAssignments(ctx, id, callback)
 }
 
-// AddProposedTickets appends new proposed tickets to the proposed sorted set with current timestamp
-func (is *instrumentedService) AddTicketsToIgnoreList(ctx context.Context, ids []string) error {
-	monitoring.IncrementCounterN(ctx, mStateStoreAddTicketsToIgnoreList, len(ids))
-	return is.s.AddTicketsToIgnoreList(ctx, ids)
+func (is *instrumentedService) AddTicketsToPendingRelease(ctx context.Context, ids []string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.AddTicketsToPendingRelease")
+	defer span.End()
+	return is.s.AddTicketsToPendingRelease(ctx, ids)
+}
+
+func (is *instrumentedService) DeleteTicketsFromPendingRelease(ctx context.Context, ids []string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.DeleteTicketsFromPendingRelease")
+	defer span.End()
+	return is.s.DeleteTicketsFromPendingRelease(ctx, ids)
+}
+
+func (is *instrumentedService) ReleaseAllTickets(ctx context.Context) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.ReleaseAllTickets")
+	defer span.End()
+	return is.s.ReleaseAllTickets(ctx)
+}
+
+// CreateBackfill creates a new Backfill in the state storage if one doesn't exist. The xids algorithm used to create the ids ensures that they are unique with no system wide synchronization. Calling clients are forbidden from choosing an id during create. So no conflicts will occur.
+func (is *instrumentedService) CreateBackfill(ctx context.Context, backfill *pb.Backfill, ticketIDs []string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.CreateBackfill")
+	defer span.End()
+	return is.s.CreateBackfill(ctx, backfill, ticketIDs)
+}
+
+// GetBackfill gets the Backfill with the specified id from state storage. This method fails if the Backfill does not exist. Returns the Backfill and associated ticketIDs if they exist.
+func (is *instrumentedService) GetBackfill(ctx context.Context, id string) (*pb.Backfill, []string, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetBackfill")
+	defer span.End()
+	return is.s.GetBackfill(ctx, id)
+}
+
+// GetBackfills returns multiple backfills from storage.
+func (is *instrumentedService) GetBackfills(ctx context.Context, ids []string) ([]*pb.Backfill, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetBackfills")
+	defer span.End()
+	return is.s.GetBackfills(ctx, ids)
+}
+
+// DeleteBackfill removes the Backfill with the specified id from state storage. This method succeeds if the Backfill does not exist.
+func (is *instrumentedService) DeleteBackfill(ctx context.Context, id string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.DeleteBackfill")
+	defer span.End()
+	return is.s.DeleteBackfill(ctx, id)
+}
+
+// UpdateBackfill updates an existing Backfill with a new data. ticketIDs can be nil.
+func (is *instrumentedService) UpdateBackfill(ctx context.Context, backfill *pb.Backfill, ticketIDs []string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.UpdateBackfill")
+	defer span.End()
+	return is.s.UpdateBackfill(ctx, backfill, ticketIDs)
+}
+
+// NewMutex returns a new distributed mutex with given name
+func (is *instrumentedService) NewMutex(key string) RedisLocker {
+	_, span := trace.StartSpan(context.Background(), "statestore/instrumented.NewMutex")
+	defer span.End()
+	return is.s.NewMutex(key)
+}
+
+// UpdateAcknowledgmentTimestamp stores Backfill's last acknowledged time
+func (is *instrumentedService) UpdateAcknowledgmentTimestamp(ctx context.Context, id string) error {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.UpdateAcknowledgmentTimestamp")
+	defer span.End()
+	return is.s.UpdateAcknowledgmentTimestamp(ctx, id)
+}
+
+// GetExpiredBackfillIDs - get all backfills which are expired
+func (is *instrumentedService) GetExpiredBackfillIDs(ctx context.Context) ([]string, error) {
+	ctx, span := trace.StartSpan(ctx, "statestore/instrumented.GetExpiredBackfillIDs")
+	defer span.End()
+	return is.s.GetExpiredBackfillIDs(ctx)
+}
+
+// IndexBackfill adds the backfill to the index.
+func (is *instrumentedService) IndexBackfill(ctx context.Context, backfill *pb.Backfill) error {
+	_, span := trace.StartSpan(ctx, "statestore/instrumented.IndexBackfill")
+	defer span.End()
+	return is.s.IndexBackfill(ctx, backfill)
+}
+
+// DeindexBackfill removes specified Backfill ID from the index. The Backfill continues to exist.
+func (is *instrumentedService) DeindexBackfill(ctx context.Context, id string) error {
+	_, span := trace.StartSpan(ctx, "statestore/instrumented.DeindexBackfill")
+	defer span.End()
+	return is.s.DeindexBackfill(ctx, id)
+}
+
+// GetIndexedBackfills returns the ids of all backfills currently indexed.
+func (is *instrumentedService) GetIndexedBackfills(ctx context.Context) (map[string]int, error) {
+	_, span := trace.StartSpan(ctx, "statestore/instrumented.GetIndexedBackfills")
+	defer span.End()
+	return is.s.GetIndexedBackfills(ctx)
+}
+
+// CleanupBackfills removes expired backfills
+func (is *instrumentedService) CleanupBackfills(ctx context.Context) error {
+	_, span := trace.StartSpan(context.Background(), "statestore/instrumented.CleanupBackfills")
+	defer span.End()
+	return is.s.CleanupBackfills(ctx)
+}
+
+// DeleteBackfillCompletely performs a set of operations to remove backfill and all related entities.
+func (is *instrumentedService) DeleteBackfillCompletely(ctx context.Context, id string) error {
+	_, span := trace.StartSpan(context.Background(), "statestore/instrumented.DeleteBackfillCompletely")
+	defer span.End()
+	return is.s.DeleteBackfillCompletely(ctx, id)
 }

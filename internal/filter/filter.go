@@ -18,49 +18,144 @@
 package filter
 
 import (
-	structpb "github.com/golang/protobuf/ptypes/struct"
+	"time"
+
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/timestamp"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"open-match.dev/open-match/pkg/pb"
 )
 
-// Filter returns all of the passed tickets which are included by all the passed filters.
-func Filter(tickets []*pb.Ticket, filters []*pb.Filter) []*pb.Ticket {
-	var result []*pb.Ticket
+var emptySearchFields = &pb.SearchFields{}
 
-	for _, t := range tickets {
-		if InFilters(t, filters) {
-			result = append(result, t)
+var (
+	logger = logrus.WithFields(logrus.Fields{
+		"app":       "openmatch",
+		"component": "filter",
+	})
+)
+
+// PoolFilter contains all the filtering criteria from a Pool that the Ticket
+// needs to meet to belong to that Pool.
+type PoolFilter struct {
+	DoubleRangeFilters  []*pb.DoubleRangeFilter
+	StringEqualsFilters []*pb.StringEqualsFilter
+	TagPresentFilters   []*pb.TagPresentFilter
+	CreatedBefore       time.Time
+	CreatedAfter        time.Time
+}
+
+// NewPoolFilter validates a Pool's filtering criteria and returns a PoolFilter.
+func NewPoolFilter(pool *pb.Pool) (*PoolFilter, error) {
+	var ca, cb time.Time
+	var err error
+
+	if pool.GetCreatedBefore() != nil {
+		if cb, err = ptypes.Timestamp(pool.GetCreatedBefore()); err != nil {
+			return nil, status.Error(codes.InvalidArgument, ".invalid created_before value")
 		}
 	}
 
-	return result
+	if pool.GetCreatedAfter() != nil {
+		if ca, err = ptypes.Timestamp(pool.GetCreatedAfter()); err != nil {
+			return nil, status.Error(codes.InvalidArgument, ".invalid created_after value")
+		}
+	}
+
+	return &PoolFilter{
+		DoubleRangeFilters:  pool.GetDoubleRangeFilters(),
+		StringEqualsFilters: pool.GetStringEqualsFilters(),
+		TagPresentFilters:   pool.GetTagPresentFilters(),
+		CreatedBefore:       cb,
+		CreatedAfter:        ca,
+	}, nil
 }
 
-// InFilters returns if the given ticket is included in all of the passed filters.
-func InFilters(ticket *pb.Ticket, filters []*pb.Filter) bool {
-	for _, f := range filters {
-		if !InFilter(ticket, f) {
+type filteredEntity interface {
+	GetId() string
+	GetSearchFields() *pb.SearchFields
+	GetCreateTime() *timestamp.Timestamp
+}
+
+// In returns true if the Ticket meets all the criteria for this PoolFilter.
+func (pf *PoolFilter) In(entity filteredEntity) bool {
+	s := entity.GetSearchFields()
+
+	if s == nil {
+		s = emptySearchFields
+	}
+
+	if !pf.CreatedAfter.IsZero() || !pf.CreatedBefore.IsZero() {
+		// CreateTime is only populated by Open Match and hence expected to be valid.
+		if ct, err := ptypes.Timestamp(entity.GetCreateTime()); err == nil {
+			if !pf.CreatedAfter.IsZero() {
+				if !ct.After(pf.CreatedAfter) {
+					return false
+				}
+			}
+
+			if !pf.CreatedBefore.IsZero() {
+				if !ct.Before(pf.CreatedBefore) {
+					return false
+				}
+			}
+		} else {
+			logger.WithFields(logrus.Fields{
+				"error": err.Error(),
+				"id":    entity.GetId(),
+			}).Error("failed to get time from Timestamp proto")
+		}
+	}
+
+	for _, f := range pf.DoubleRangeFilters {
+		v, ok := s.DoubleArgs[f.DoubleArg]
+		if !ok {
+			return false
+		}
+
+		switch f.Exclude {
+		case pb.DoubleRangeFilter_NONE:
+			// Not simplified so that NaN cases are handled correctly.
+			if !(v >= f.Min && v <= f.Max) {
+				return false
+			}
+		case pb.DoubleRangeFilter_MIN:
+			if !(v > f.Min && v <= f.Max) {
+				return false
+			}
+		case pb.DoubleRangeFilter_MAX:
+			if !(v >= f.Min && v < f.Max) {
+				return false
+			}
+		case pb.DoubleRangeFilter_BOTH:
+			if !(v > f.Min && v < f.Max) {
+				return false
+			}
+		}
+
+	}
+
+	for _, f := range pf.StringEqualsFilters {
+		v, ok := s.StringArgs[f.StringArg]
+		if !ok {
+			return false
+		}
+		if f.Value != v {
 			return false
 		}
 	}
+
+outer:
+	for _, f := range pf.TagPresentFilters {
+		for _, v := range s.Tags {
+			if v == f.Tag {
+				continue outer
+			}
+		}
+		return false
+	}
+
 	return true
-}
-
-// InFilter returns if the given ticket is included in the given filter.
-func InFilter(ticket *pb.Ticket, filter *pb.Filter) bool {
-	if ticket.GetProperties().GetFields() == nil {
-		return false
-	}
-
-	v, ok := ticket.Properties.Fields[filter.Attribute]
-	if !ok {
-		return false
-	}
-
-	switch v.Kind.(type) {
-	case *structpb.Value_NumberValue:
-		nv := v.GetNumberValue()
-		return filter.Min <= nv && nv <= filter.Max
-	default:
-		return false
-	}
 }

@@ -17,11 +17,13 @@ package director
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"time"
 
+	"google.golang.org/grpc"
+
 	"open-match.dev/open-match/examples/demo/components"
-	"open-match.dev/open-match/internal/rpc"
 	"open-match.dev/open-match/pkg/pb"
 )
 
@@ -65,12 +67,13 @@ func run(ds *components.DemoShared) {
 	s.Status = "Connecting to backend"
 	ds.Update(s)
 
-	conn, err := rpc.GRPCClientFromConfig(ds.Cfg, "api.backend")
+	// See https://open-match.dev/site/docs/guides/api/
+	conn, err := grpc.Dial("open-match-backend.open-match.svc.cluster.local:50505", grpc.WithInsecure())
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
-	be := pb.NewBackendClient(conn)
+	be := pb.NewBackendServiceClient(conn)
 
 	//////////////////////////////////////////////////////////////////////////////
 	s.Status = "Match Match: Sending Request"
@@ -80,35 +83,35 @@ func run(ds *components.DemoShared) {
 	{
 		req := &pb.FetchMatchesRequest{
 			Config: &pb.FunctionConfig{
-				Host: ds.Cfg.GetString("api.functions.hostname"),
-				Port: int32(ds.Cfg.GetInt("api.functions.grpcport")),
+				Host: "om-function.open-match-demo.svc.cluster.local",
+				Port: 50502,
 				Type: pb.FunctionConfig_GRPC,
 			},
-			Profiles: []*pb.MatchProfile{
-				{
-					Name: "1v1",
-					Pools: []*pb.Pool{
-						{
-							Name: "Everyone",
-							Filters: []*pb.Filter{
-								{
-									Attribute: "mode.demo",
-									Min:       -100,
-									Max:       100,
-								},
-							},
-						},
+			Profile: &pb.MatchProfile{
+				Name: "1v1",
+				Pools: []*pb.Pool{
+					{
+						Name: "Everyone",
 					},
 				},
 			},
 		}
 
-		resp, err := be.FetchMatches(ds.Ctx, req)
+		stream, err := be.FetchMatches(ds.Ctx, req)
 		if err != nil {
 			panic(err)
 		}
 
-		matches = resp.Matches
+		for {
+			resp, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				panic(err)
+			}
+			matches = append(matches, resp.GetMatch())
+		}
 	}
 
 	//////////////////////////////////////////////////////////////////////////////
@@ -128,9 +131,13 @@ func run(ds *components.DemoShared) {
 		}
 
 		req := &pb.AssignTicketsRequest{
-			TicketIds: ids,
-			Assignment: &pb.Assignment{
-				Connection: fmt.Sprintf("%d.%d.%d.%d:2222", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)),
+			Assignments: []*pb.AssignmentGroup{
+				{
+					TicketIds: ids,
+					Assignment: &pb.Assignment{
+						Connection: fmt.Sprintf("%d.%d.%d.%d:2222", rand.Intn(256), rand.Intn(256), rand.Intn(256), rand.Intn(256)),
+					},
+				},
 			},
 		}
 

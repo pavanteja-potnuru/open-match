@@ -1,33 +1,35 @@
+// Copyright 2019 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package synchronizer
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sync"
 
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"open-match.dev/open-match/internal/config"
 	"open-match.dev/open-match/internal/rpc"
 	"open-match.dev/open-match/pkg/pb"
-)
-
-type evaluator interface {
-	evaluate([]*pb.Match) ([]*pb.Match, error)
-}
-
-type clientType int
-
-// Different type of clients supported for evaluation.
-const (
-	none clientType = iota
-	grpcEvaluator
-	httpEvaluator
 )
 
 var (
@@ -37,122 +39,248 @@ var (
 	})
 )
 
-type evaluatorClient struct {
-	clType     clientType
-	cfg        config.View
-	grpcClient pb.EvaluatorClient
+type evaluator interface {
+	evaluate(context.Context, <-chan []*pb.Match, chan<- string) error
+}
+
+var errNoEvaluatorType = status.Errorf(codes.FailedPrecondition, "unable to determine evaluator type, either api.evaluator.grpcport or api.evaluator.httpport must be specified in the config")
+
+func newEvaluator(cfg config.View) evaluator {
+	newInstance := func(cfg config.View) (interface{}, func(), error) {
+		// grpc is preferred over http.
+		if cfg.IsSet("api.evaluator.grpcport") {
+			return newGrpcEvaluator(cfg)
+		}
+		if cfg.IsSet("api.evaluator.httpport") {
+			return newHTTPEvaluator(cfg)
+		}
+		return nil, nil, errNoEvaluatorType
+	}
+
+	return &deferredEvaluator{
+		cacher: config.NewCacher(cfg, newInstance),
+	}
+}
+
+type deferredEvaluator struct {
+	cacher *config.Cacher
+}
+
+func (de *deferredEvaluator) evaluate(ctx context.Context, pc <-chan []*pb.Match, acceptedIds chan<- string) error {
+	e, err := de.cacher.Get()
+	if err != nil {
+		return err
+	}
+
+	err = e.(evaluator).evaluate(ctx, pc, acceptedIds)
+	if err != nil {
+		de.cacher.ForceReset()
+	}
+	return err
+}
+
+type grcpEvaluatorClient struct {
+	evaluator pb.EvaluatorClient
+}
+
+func newGrpcEvaluator(cfg config.View) (evaluator, func(), error) {
+	grpcAddr := fmt.Sprintf("%s:%d", cfg.GetString("api.evaluator.hostname"), cfg.GetInt64("api.evaluator.grpcport"))
+	conn, err := rpc.GRPCClientFromEndpoint(cfg, grpcAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create grpc evaluator client: %w", err)
+	}
+
+	evaluatorClientLogger.WithFields(logrus.Fields{
+		"endpoint": grpcAddr,
+	}).Info("Created a GRPC client for evaluator endpoint.")
+
+	close := func() {
+		err := conn.Close()
+		if err != nil {
+			logger.WithError(err).Warning("Error closing synchronizer client.")
+		}
+	}
+
+	return &grcpEvaluatorClient{
+		evaluator: pb.NewEvaluatorClient(conn),
+	}, close, nil
+}
+
+func (ec *grcpEvaluatorClient) evaluate(ctx context.Context, pc <-chan []*pb.Match, acceptedIds chan<- string) error {
+	eg, ctx := errgroup.WithContext(ctx)
+
+	var stream pb.Evaluator_EvaluateClient
+	{ // prevent shadowing err later
+		var err error
+		stream, err = ec.evaluator.Evaluate(ctx)
+		if err != nil {
+			return fmt.Errorf("error starting evaluator call: %w", err)
+		}
+	}
+
+	matchIDs := &sync.Map{}
+	eg.Go(func() error {
+		for proposals := range pc {
+			for _, proposal := range proposals {
+
+				if _, ok := matchIDs.LoadOrStore(proposal.GetMatchId(), true); ok {
+					return fmt.Errorf("multiple match functions used same match_id: \"%s\"", proposal.GetMatchId())
+				}
+				if err := stream.Send(&pb.EvaluateRequest{Match: proposal}); err != nil {
+					return fmt.Errorf("failed to send request to evaluator, desc: %w", err)
+				}
+			}
+		}
+
+		if err := stream.CloseSend(); err != nil {
+			return fmt.Errorf("failed to close the send direction of evaluator stream, desc: %w", err)
+		}
+		return nil
+	})
+
+	eg.Go(func() error {
+		for {
+			// TODO: add grpc timeouts for this call.
+			resp, err := stream.Recv()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("failed to get response from evaluator client, desc: %w", err)
+			}
+
+			v, ok := matchIDs.Load(resp.GetMatchId())
+			if !ok {
+				return fmt.Errorf("evaluator returned match_id \"%s\" which does not correspond to its any match in its input", resp.GetMatchId())
+			}
+			if !v.(bool) {
+				return fmt.Errorf("evaluator returned same match_id twice: \"%s\"", resp.GetMatchId())
+			}
+			matchIDs.Store(resp.GetMatchId(), false)
+			acceptedIds <- resp.GetMatchId()
+		}
+	})
+
+	err := eg.Wait()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type httpEvaluatorClient struct {
 	httpClient *http.Client
 	baseURL    string
-	m          sync.Mutex
 }
 
-// evaluate method triggers execution of user evaluation function. It initializes the configured
-// GRPC or HTTP client. If the client was already initialized, initialize is a no-op.
-func (ec *evaluatorClient) evaluate(proposals []*pb.Match) (result []*pb.Match, err error) {
-	if err := ec.initialize(); err != nil {
-		return nil, err
-	}
-
-	// Call the appropriate client's evaluation function.
-	switch ec.clType {
-	case grpcEvaluator:
-		return ec.grpcEvaluate(proposals)
-	case httpEvaluator:
-		return ec.httpEvaluate(proposals)
-	default:
-		return nil, status.Error(codes.Unavailable, "failed to initialize a connection to the evaluator")
-	}
-}
-
-// initialize sets up the configured GRPC or HTTP client the first time it is called. Consequent
-// invocations after a successful client setup are a no-op. It attempts to initialize either GRPC
-// or HTTP clients. If both are defined, it prefers GRPC client.
-func (ec *evaluatorClient) initialize() error {
-	ec.m.Lock()
-	defer ec.m.Unlock()
-	if ec.clType != none {
-		// Client already initialized.
-		return nil
-	}
-
-	// Evaluator client not initialized. Attempt to initialize GRPC client or HTTP client.
-	grpcAddr := fmt.Sprintf("%s:%d", ec.cfg.GetString("api.evaluator.hostname"), ec.cfg.GetInt64("api.evaluator.grpcport"))
-	conn, err := rpc.GRPCClientFromEndpoint(ec.cfg, grpcAddr)
-	if err == nil {
-		evaluatorClientLogger.WithFields(logrus.Fields{
-			"endpoint": grpcAddr,
-		}).Info("Created a GRPC client for input endpoint.")
-		ec.grpcClient = pb.NewEvaluatorClient(conn)
-		ec.clType = grpcEvaluator
-		return nil
-	}
-
-	evaluatorClientLogger.WithError(err).Errorf("failed to get a GRPC client from the endpoint %v", grpcAddr)
-	httpAddr := fmt.Sprintf("%s:%d", ec.cfg.GetString("api.evaluator.hostname"), ec.cfg.GetInt64("api.evaluator.httpport"))
-	client, baseURL, err := rpc.HTTPClientFromEndpoint(ec.cfg, httpAddr)
+func newHTTPEvaluator(cfg config.View) (evaluator, func(), error) {
+	httpAddr := fmt.Sprintf("%s:%d", cfg.GetString("api.evaluator.hostname"), cfg.GetInt64("api.evaluator.httpport"))
+	client, baseURL, err := rpc.HTTPClientFromEndpoint(cfg, httpAddr)
 	if err != nil {
-		evaluatorClientLogger.WithError(err).Errorf("failed to get a HTTP client from the endpoint %v", httpAddr)
-		return err
+		return nil, nil, fmt.Errorf("failed to get a HTTP client from the endpoint %v: %w", httpAddr, err)
 	}
 
 	evaluatorClientLogger.WithFields(logrus.Fields{
 		"endpoint": httpAddr,
-	}).Info("Created a HTTP client for input endpoint.")
-	ec.httpClient = client
-	ec.baseURL = baseURL
-	return nil
+	}).Info("Created a HTTP client for evaluator endpoint.")
+
+	close := func() {
+		client.CloseIdleConnections()
+	}
+
+	return &httpEvaluatorClient{
+		httpClient: client,
+		baseURL:    baseURL,
+	}, close, nil
 }
 
-func (ec *evaluatorClient) grpcEvaluate(proposals []*pb.Match) (results []*pb.Match, err error) {
-	resp, err := ec.grpcClient.Evaluate(context.Background(), &pb.EvaluateRequest{Matches: proposals})
-	if err != nil {
-		return nil, err
-	}
+func (ec *httpEvaluatorClient) evaluate(ctx context.Context, pc <-chan []*pb.Match, acceptedIds chan<- string) error {
+	reqr, reqw := io.Pipe()
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-	return resp.GetMatches(), nil
-}
-
-func (ec *evaluatorClient) httpEvaluate(proposals []*pb.Match) (results []*pb.Match, err error) {
-	proposalIDs := getMatchIds(proposals)
-	jsonProposals, err := json.Marshal(proposals)
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "failed to marshal proposals to string for proposals %s: %s", proposalIDs, err.Error())
-	}
-
-	reqBody, err := json.Marshal(map[string]json.RawMessage{"match": jsonProposals})
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "failed to marshal request body for proposals %s: %s", proposalIDs, err.Error())
-	}
-
-	req, err := http.NewRequest("POST", ec.baseURL+"/v1/matches:evaluate", bytes.NewBuffer(reqBody))
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "failed to create evaluator http request for proposals %s: %s", proposalIDs, err.Error())
-	}
-
-	resp, err := ec.httpClient.Do(req.WithContext(context.Background()))
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get response from evaluator for proposals %s: %s", proposalIDs, err.Error())
-	}
-
-	defer func() {
-		err = resp.Body.Close()
-		if err != nil {
-			evaluatorClientLogger.WithError(err).Warning("failed to close response body read closer")
+	sc := make(chan error, 1)
+	defer close(sc)
+	go func() {
+		var m jsonpb.Marshaler
+		defer func() {
+			wg.Done()
+			if reqw.Close() != nil {
+				logger.Warning("failed to close response body read closer")
+			}
+		}()
+		for proposals := range pc {
+			for _, proposal := range proposals {
+				buf, err := m.MarshalToString(&pb.EvaluateRequest{Match: proposal})
+				if err != nil {
+					sc <- status.Errorf(codes.FailedPrecondition, "failed to marshal proposal to string: %s", err.Error())
+					return
+				}
+				_, err = io.WriteString(reqw, buf)
+				if err != nil {
+					sc <- status.Errorf(codes.FailedPrecondition, "failed to write proto string to io writer: %s", err.Error())
+					return
+				}
+			}
 		}
 	}()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	req, err := http.NewRequest("POST", ec.baseURL+"/v1/evaluator/matches:evaluate", reqr)
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"failed to read from response body for proposals %s: %s", proposalIDs, err.Error())
+		return status.Errorf(codes.Aborted, "failed to create evaluator http request, desc: %s", err.Error())
 	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Transfer-Encoding", "chunked")
 
-	pbResp := &pb.EvaluateResponse{}
-	err = json.Unmarshal(body, pbResp)
+	resp, err := ec.httpClient.Do(req.WithContext(ctx))
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"failed to unmarshal response body to response pb for proposals %s: %s", proposalIDs, err.Error())
+		return status.Errorf(codes.Aborted, "failed to get response from evaluator, desc: %s", err.Error())
 	}
+	defer func() {
+		if resp.Body.Close() != nil {
+			logger.Warning("failed to close response body read closer")
+		}
+	}()
 
-	return pbResp.GetMatches(), nil
+	wg.Add(1)
+	rc := make(chan error, 1)
+	defer close(rc)
+	go func() {
+		defer wg.Done()
+
+		dec := json.NewDecoder(resp.Body)
+		for {
+			var item struct {
+				Result json.RawMessage        `json:"result"`
+				Error  map[string]interface{} `json:"error"`
+			}
+			err := dec.Decode(&item)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				rc <- status.Errorf(codes.Unavailable, "failed to read response from HTTP JSON stream: %s", err.Error())
+				return
+			}
+			if len(item.Error) != 0 {
+				rc <- status.Errorf(codes.Unavailable, "failed to execute evaluator.Evaluate: %v", item.Error)
+				return
+			}
+			resp := &pb.EvaluateResponse{}
+			if err = jsonpb.UnmarshalString(string(item.Result), resp); err != nil {
+				rc <- status.Errorf(codes.Unavailable, "failed to execute jsonpb.UnmarshalString(%s, &proposal): %v.", item.Result, err)
+				return
+			}
+			acceptedIds <- resp.GetMatchId()
+		}
+	}()
+
+	wg.Wait()
+	if len(sc) != 0 {
+		return <-sc
+	}
+	if len(rc) != 0 {
+		return <-rc
+	}
+	return nil
 }
